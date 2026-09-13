@@ -94,72 +94,195 @@ async function connectDatabase(attempt = 1) {
     console.error("[DB] MONGODB_URI not set — database unavailable.");
     return;
   }
+
   try {
     // Close any stale client before reconnecting
     if (client) {
-      try { await client.close(true); } catch (_) { /* ignore */ }
+      try {
+        await client.close(true);
+      } catch (_) {
+        // Ignore errors while closing a stale connection
+      }
       client = null;
       db = null;
     }
 
+    /*
+     * MongoDB Atlas connection.
+     *
+     * Important:
+     * - family: 4 forces IPv4, which avoids IPv6/network-path issues
+     *   that can occur on some cloud runtimes.
+     * - TLS is enabled automatically for mongodb+srv Atlas connections,
+     *   so we do not force custom certificate restrictions here.
+     * - serverApi gives us a stable Atlas-compatible API contract.
+     */
     client = new MongoClient(MONGODB_URI, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-      socketTimeoutMS: 30000,
-      // Explicit TLS settings for Node 22 / OpenSSL 3 compatibility
-      tls: true,
-      tlsAllowInvalidCertificates: false,
-      tlsAllowInvalidHostnames: false,
+      family: 4,
+      serverSelectionTimeoutMS: 20000,
+      connectTimeoutMS: 20000,
+      socketTimeoutMS: 45000,
+      maxPoolSize: 10,
+      minPoolSize: 0,
+      retryWrites: true,
+      retryReads: true,
+      serverApi: {
+        version: "1",
+        strict: false,
+        deprecationErrors: true
+      }
     });
 
+    console.log(`[DB] Attempting MongoDB Atlas connection (attempt ${attempt})...`);
+
     await client.connect();
+
     db = client.db(DB_NAME);
 
-    // Verify the connection is truly live
+    // Verify the connection is genuinely usable.
     await db.command({ ping: 1 });
 
+    // Create indexes used by the application.
     await Promise.all([
-      db.collection("users").createIndex({ email: 1 }, { unique: true }),
-      db.collection("problems").createIndex({ status: 1, department: 1 }),
-      db.collection("applications").createIndex({ problemId: 1, startupId: 1 }, { unique: true }),
-      db.collection("notifications").createIndex({ recipient: 1, read: 1 }),
-      db.collection("audit_events").createIndex({ timestamp: -1 })
+      db.collection("users").createIndex(
+        { email: 1 },
+        { unique: true }
+      ),
+
+      db.collection("problems").createIndex(
+        { status: 1, department: 1 }
+      ),
+
+      db.collection("applications").createIndex(
+        { problemId: 1, startupId: 1 },
+        { unique: true }
+      ),
+
+      db.collection("notifications").createIndex(
+        { recipient: 1, read: 1 }
+      ),
+
+      db.collection("audit_events").createIndex(
+        { timestamp: -1 }
+      )
     ]);
 
+    // Connection is healthy.
     dbError = null;
-    console.log(`[DB] Connected to MongoDB Atlas (attempt ${attempt}).`);
 
-    // Listen for topology events so we know if the connection drops later
+    console.log(
+      `[DB] Connected to MongoDB Atlas successfully (attempt ${attempt}).`
+    );
+    console.log(`[DB] Database: ${DB_NAME}`);
+
+    /*
+     * Monitor connection lifecycle.
+     */
     client.on("close", () => {
       db = null;
       dbError = "Database connection lost. Reconnecting…";
-      console.warn("[DB] Connection closed — scheduling reconnect.");
+
+      console.warn(
+        "[DB] MongoDB connection closed — scheduling reconnect."
+      );
+
       scheduleReconnect();
     });
-    client.on("error", (err) => {
-      console.error("[DB] MongoClient error:", err.message);
+
+    client.on("error", (error) => {
+      console.error(
+        "[DB] MongoClient error:",
+        error?.name || "UnknownError",
+        error?.message || "Unknown MongoDB error"
+      );
     });
 
   } catch (error) {
     db = null;
-    const msg = error.message || "";
-    if (msg.includes("SSL") || msg.includes("TLS") || msg.includes("tls") || msg.includes("ssl") || msg.includes("alert")) {
-      dbError = "Database TLS/SSL error — your server IP may not be whitelisted in MongoDB Atlas. " +
-        "Go to Atlas → Network Access → Add IP Address and add your current IP.";
+
+    const msg = String(error?.message || "");
+    const errorName = String(error?.name || "");
+    const errorCode = error?.code !== undefined
+      ? String(error.code)
+      : "";
+
+    console.error("[DB] MongoDB connection failed.");
+    console.error("[DB] Error name:", errorName);
+    console.error("[DB] Error code:", errorCode);
+    console.error("[DB] Error message:", msg.substring(0, 500));
+
+    /*
+     * Do NOT automatically claim that every TLS error means
+     * the Atlas IP allowlist is wrong.
+     *
+     * Atlas already accepts Render's outbound CIDR ranges.
+     */
+    if (
+      msg.includes("SSL") ||
+      msg.includes("TLS") ||
+      msg.includes("tls") ||
+      msg.includes("ssl") ||
+      msg.includes("alert") ||
+      errorName.includes("MongoServerSelectionError") ||
+      errorName.includes("MongoNetworkError")
+    ) {
+      dbError =
+        "MongoDB Atlas connection failed during network/TLS negotiation. " +
+        "The Atlas IP allowlist is configured, so check the Render network path, " +
+        "MongoDB driver version, and connection settings.";
+
       console.error(
-        "[DB] TLS/SSL connection rejected by Atlas. Most likely cause: your IP is NOT in the Atlas IP allowlist.\n" +
-        "     Current server IP: check https://api.ipify.org\n" +
-        "     Fix: MongoDB Atlas → Network Access → Add IP Address → add your IP (or 0.0.0.0/0 for dev).\n" +
-        "     Error:", msg.substring(0, 200)
+        "[DB] Network/TLS connection problem detected."
       );
-    } else if (msg.includes("ECONNREFUSED") || msg.includes("ENOTFOUND") || msg.includes("timeout")) {
-      dbError = "Database unreachable — check MONGODB_URI and network connectivity.";
-      console.error("[DB] Connection failed (network):", msg.substring(0, 200));
+      console.error(
+        "[DB] Atlas Render ranges currently expected: " +
+        "74.220.48.0/24 and 74.220.56.0/24"
+      );
+      console.error(
+        "[DB] IPv4-only connection mode is enabled for the next attempt."
+      );
+
+    } else if (
+      msg.includes("Authentication failed") ||
+      msg.includes("bad auth") ||
+      msg.includes("Unauthorized")
+    ) {
+      dbError =
+        "MongoDB authentication failed. Check the Atlas database username " +
+        "and password configured in Render.";
+
+      console.error(
+        "[DB] MongoDB authentication failed. Check the Atlas database user credentials."
+      );
+
+    } else if (
+      msg.includes("ECONNREFUSED") ||
+      msg.includes("ENOTFOUND") ||
+      msg.includes("ETIMEDOUT") ||
+      msg.includes("timeout") ||
+      msg.includes("EAI_AGAIN")
+    ) {
+      dbError =
+        "MongoDB is unreachable from the Render server. " +
+        "Check Atlas network access and the MongoDB connection string.";
+
+      console.error(
+        "[DB] MongoDB network connectivity problem detected."
+      );
+
     } else {
-      dbError = "Database connection unavailable.";
-      console.error("[DB] Connection failed:", msg.substring(0, 200));
+      dbError =
+        "Database connection unavailable. Check the Render MongoDB configuration.";
+
+      console.error(
+        "[DB] MongoDB connection failed:",
+        msg.substring(0, 500)
+      );
     }
-    // Schedule automatic reconnect (backs off: 10s, 20s, 40s … up to 5 min)
+
+    /*
+     * Automatic reconnect with increasing delay.
+     */
     scheduleReconnect(attempt);
   }
 }
@@ -332,8 +455,8 @@ app.get("/api/health", (req, res) => res.json({
   ok: true,
   database: db ? "connected" : "unavailable",
   error: dbError || null,
-  hint: (!db && dbError && (dbError.includes("TLS") || dbError.includes("SSL")))
-    ? "Your server IP is likely not whitelisted in MongoDB Atlas. Go to Atlas → Network Access → Add IP Address."
+  hint: !db
+    ? "MongoDB Atlas connection is currently unavailable. Check the database error above."
     : undefined,
   node: process.version,
   openssl: process.versions.openssl
